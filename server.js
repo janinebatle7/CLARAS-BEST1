@@ -1,124 +1,208 @@
-import 'dotenv/config';
 import express from 'express';
-import cors from 'cors';
 import mysql from 'mysql2/promise';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
+import dotenv from 'dotenv';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PORT = process.env.PORT || 3000;
-
+dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
-app.use(express.json({ limit: '10mb' }));
+app.use(cors());
+app.use(express.json());
 
-let pool;
-let fallbackState = null;
-
-function getSslOptions() {
-  const caFromBase64 = process.env.AIVEN_CA_CERT_BASE64
-    ? Buffer.from(process.env.AIVEN_CA_CERT_BASE64, 'base64').toString('utf8')
-    : undefined;
-  const caFromText = process.env.AIVEN_CA_CERT?.replace(/\\n/g, '\n');
-  const caFromPath = process.env.AIVEN_CA_CERT_PATH && fs.existsSync(process.env.AIVEN_CA_CERT_PATH)
-    ? fs.readFileSync(process.env.AIVEN_CA_CERT_PATH, 'utf8')
-    : undefined;
-  const ca = caFromBase64 || caFromText || caFromPath;
-  if (ca) return { ca, rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false' };
-  if (process.env.DB_SSL === 'false') return undefined;
-  return { rejectUnauthorized: false };
-}
-
-function getDbConfig() {
-  const uri = process.env.DATABASE_URL || process.env.MYSQL_URL;
-  if (uri) return { uri, ssl: getSslOptions(), waitForConnections: true, connectionLimit: 10 };
-  if (!process.env.AIVEN_DB_HOST && !process.env.DB_HOST) return null;
-  return {
-    host: process.env.AIVEN_DB_HOST || process.env.DB_HOST,
-    port: Number(process.env.AIVEN_DB_PORT || process.env.DB_PORT || 3306),
-    user: process.env.AIVEN_DB_USER || process.env.DB_USER,
-    password: process.env.AIVEN_DB_PASSWORD || process.env.DB_PASSWORD,
-    database: process.env.AIVEN_DB_NAME || process.env.DB_NAME || 'defaultdb',
-    ssl: getSslOptions(),
-    waitForConnections: true,
-    connectionLimit: 10,
-  };
-}
-
-async function getPool() {
-  if (pool) return pool;
-  const config = getDbConfig();
-  if (!config) return null;
-  pool = mysql.createPool(config);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_state (
-      id TINYINT PRIMARY KEY,
-      data LONGTEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )
-  `);
-  return pool;
-}
-
-async function readState() {
-  const db = await getPool();
-  if (!db) return fallbackState;
-  const [rows] = await db.query('SELECT data FROM app_state WHERE id = 1 LIMIT 1');
-  if (!rows.length) return null;
-  return JSON.parse(rows[0].data);
-}
-
-async function writeState(state) {
-  fallbackState = state;
-  const db = await getPool();
-  if (!db) return;
-  await db.query(
-    'INSERT INTO app_state (id, data) VALUES (1, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)',
-    [JSON.stringify(state)],
-  );
-}
-
-app.get('/api/health', async (_req, res) => {
-  try {
-    const db = await getPool();
-    if (db) await db.query('SELECT 1');
-    res.json({ ok: true, database: db ? 'mysql' : 'memory-fallback' });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
+// ─── MySQL Connection (Aiven Cloud) ───
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT || '3306'),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  ssl: { rejectUnauthorized: true },
+  waitForConnections: true,
+  connectionLimit: 10,
 });
 
-app.get('/api/bootstrap', async (_req, res) => {
+// ─── Initialize DB ───
+async function initDB() {
   try {
-    const state = await readState();
-    res.json({ ok: true, state });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.put('/api/snapshot', async (req, res) => {
-  try {
-    if (!req.body?.state || typeof req.body.state !== 'object') {
-      return res.status(400).json({ ok: false, error: 'Missing state payload' });
+    const schema = readFileSync(path.join(__dirname, 'db/schema.sql'), 'utf-8');
+    const statements = schema.split(';').filter(s => s.trim());
+    const conn = await pool.getConnection();
+    for (const stmt of statements) {
+      try { await conn.query(stmt); } catch (e) { /* ignore duplicate inserts */ }
     }
-    await writeState(req.body.state);
-    res.json({ ok: true, savedAt: new Date().toISOString() });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
+    conn.release();
+    console.log('✅ Database initialized');
+  } catch (err) {
+    console.error('❌ DB init error:', err.message);
+  }
+}
+
+// ─── USERS ───
+app.get('/api/users', async (req, res) => {
+  const [rows] = await pool.query('SELECT id, email, name, role, phone, street, address FROM users ORDER BY id');
+  res.json(rows);
+});
+app.post('/api/users', async (req, res) => {
+  const { email, name, role, phone, street, address } = req.body;
+  try {
+    const [result] = await pool.query('INSERT INTO users (email, name, role, phone, street, address) VALUES (?, ?, ?, ?, ?, ?)', [email, name, role || 'customer', phone || '', street || '', address || '']);
+    res.json({ id: result.insertId, email, name, role: role || 'customer', phone: phone || '', street: street || '', address: address || '' });
+  } catch (e) { res.status(400).json({ error: 'Email already exists' }); }
+});
+app.put('/api/users/:id', async (req, res) => {
+  const { name, phone, street, address } = req.body;
+  await pool.query('UPDATE users SET name=?, phone=?, street=?, address=? WHERE id=?', [name, phone, street, address, req.params.id]);
+  res.json({ success: true });
+});
+app.delete('/api/users/:id', async (req, res) => {
+  await pool.query('DELETE FROM users WHERE id=?', [req.params.id]);
+  res.json({ success: true });
+});
+app.post('/api/login', async (req, res) => {
+  const { email } = req.body;
+  const [rows] = await pool.query('SELECT id, email, name, role, phone, street, address FROM users WHERE email=?', [email]);
+  if (rows.length > 0) res.json(rows[0]);
+  else res.status(401).json({ error: 'Invalid credentials' });
+});
+
+// ─── PRODUCTS ───
+app.get('/api/products', async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM products ORDER BY id');
+  res.json(rows.map(r => ({ ...r, price: parseFloat(r.price), rating: parseFloat(r.rating) })));
+});
+app.post('/api/products', async (req, res) => {
+  const { name, price, image, description, category, stock, rating, reviews } = req.body;
+  const [result] = await pool.query('INSERT INTO products (name, price, image, description, category, stock, rating, reviews) VALUES (?,?,?,?,?,?,?,?)',
+    [name, price, image || '/images/bibingka.jpg', description || '', category || '', stock || 0, rating || 4.5, reviews || 0]);
+  res.json({ id: result.insertId, ...req.body });
+});
+app.put('/api/products/:id', async (req, res) => {
+  const fields = req.body;
+  const sets = Object.keys(fields).map(k => `${k}=?`).join(', ');
+  await pool.query(`UPDATE products SET ${sets} WHERE id=?`, [...Object.values(fields), req.params.id]);
+  res.json({ success: true });
+});
+app.delete('/api/products/:id', async (req, res) => {
+  await pool.query('DELETE FROM products WHERE id=?', [req.params.id]);
+  res.json({ success: true });
+});
+app.put('/api/products/:id/stock', async (req, res) => {
+  const { amount } = req.body;
+  await pool.query('UPDATE products SET stock = GREATEST(0, stock + ?) WHERE id=?', [amount, req.params.id]);
+  const [rows] = await pool.query('SELECT stock FROM products WHERE id=?', [req.params.id]);
+  res.json({ stock: rows[0]?.stock || 0 });
+});
+
+// ─── ORDERS ───
+app.get('/api/orders', async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM orders ORDER BY id DESC');
+  res.json(rows.map(r => ({
+    id: r.id, customer: r.customer_email, customerName: r.customer_name,
+    customerPhone: r.customer_phone, customerStreet: r.customer_street, customerAddress: r.customer_address,
+    items: r.items, itemCount: r.item_count, total: parseFloat(r.total),
+    status: r.status, type: r.type, date: r.order_date, time: r.order_time,
+  })));
+});
+app.post('/api/orders', async (req, res) => {
+  const o = req.body;
+  const [result] = await pool.query(
+    'INSERT INTO orders (customer_email, customer_name, customer_phone, customer_street, customer_address, items, item_count, total, status, type, order_date, order_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    [o.customer, o.customerName, o.customerPhone || '', o.customerStreet || '', o.customerAddress || '', o.items, o.itemCount, o.total, o.status || 'PENDING', o.type || 'Walk-in', o.date, o.time]
+  );
+  // Decrease stock
+  if (o.cartItems) {
+    for (const ci of o.cartItems) {
+      await pool.query('UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id=?', [ci.quantity, ci.id]);
+    }
+  }
+  res.json({ id: result.insertId, ...o });
+});
+app.put('/api/orders/:id/status', async (req, res) => {
+  const { status } = req.body;
+  await pool.query('UPDATE orders SET status=? WHERE id=?', [status, req.params.id]);
+  res.json({ success: true });
+});
+app.delete('/api/orders/:id', async (req, res) => {
+  await pool.query('DELETE FROM orders WHERE id=?', [req.params.id]);
+  res.json({ success: true });
+});
+
+// ─── RESERVATIONS ───
+app.get('/api/reservations', async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM reservations ORDER BY id DESC');
+  res.json(rows.map(r => ({ id: r.id, name: r.name, email: r.email, date: r.res_date, time: r.res_time, guests: r.guests, notes: r.notes, status: r.status, type: r.type, items: r.items })));
+});
+app.post('/api/reservations', async (req, res) => {
+  const r = req.body;
+  const [result] = await pool.query('INSERT INTO reservations (name, email, res_date, res_time, guests, notes, type, items) VALUES (?,?,?,?,?,?,?,?)',
+    [r.name, r.email, r.date, r.time, r.guests, r.notes || '', r.type || 'Pick-up', r.items || '']);
+  res.json({ id: result.insertId, ...r, status: 'pending' });
+});
+app.put('/api/reservations/:id/status', async (req, res) => {
+  await pool.query('UPDATE reservations SET status=? WHERE id=?', [req.body.status, req.params.id]);
+  res.json({ success: true });
+});
+
+// ─── FEEDBACK ───
+app.get('/api/feedbacks', async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM feedbacks ORDER BY id DESC');
+  res.json(rows.map(r => ({ id: r.id, name: r.name, email: r.email, subject: r.subject, message: r.message, date: r.created_at?.toLocaleDateString?.('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) || '', read: !!r.is_read, reply: r.reply || '', replyDate: r.reply_date || '' })));
+});
+app.post('/api/feedbacks', async (req, res) => {
+  const f = req.body;
+  const [result] = await pool.query('INSERT INTO feedbacks (name, email, subject, message) VALUES (?,?,?,?)', [f.name, f.email, f.subject, f.message]);
+  res.json({ id: result.insertId, ...f, read: false, reply: '', replyDate: '', date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) });
+});
+app.put('/api/feedbacks/:id/read', async (req, res) => {
+  await pool.query('UPDATE feedbacks SET is_read=TRUE WHERE id=?', [req.params.id]);
+  res.json({ success: true });
+});
+app.put('/api/feedbacks/:id/reply', async (req, res) => {
+  const { reply } = req.body;
+  const replyDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  await pool.query('UPDATE feedbacks SET reply=?, reply_date=?, is_read=TRUE WHERE id=?', [reply, replyDate, req.params.id]);
+  res.json({ success: true, replyDate });
+});
+
+// ─── SETTINGS ───
+app.get('/api/settings', async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM settings WHERE id=1');
+  if (rows.length > 0) {
+    const s = rows[0];
+    res.json({ storeName: s.store_name, contactEmail: s.contact_email, phone: s.phone, address: s.address, hours: s.hours, facebook: s.facebook });
+  } else res.json({});
+});
+app.put('/api/settings', async (req, res) => {
+  const s = req.body;
+  await pool.query('UPDATE settings SET store_name=?, contact_email=?, phone=?, address=?, hours=?, facebook=? WHERE id=1',
+    [s.storeName, s.contactEmail, s.phone, s.address, s.hours, s.facebook]);
+  res.json({ success: true });
+});
+
+// ─── Health check ───
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'connected', timestamp: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ status: 'error', db: 'disconnected', error: e.message });
   }
 });
 
-const distPath = path.join(__dirname, 'dist');
-if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
-  app.get(/.*/, (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
-} else {
-  app.get('/', (_req, res) => res.send('Build the frontend first with npm run build.'));
-}
+// ─── Serve Frontend ───
+app.use(express.static(path.join(__dirname, 'dist')));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
 
-app.listen(PORT, () => {
-  console.log(`Clara's Best system running on port ${PORT}`);
+// ─── Start ───
+const PORT = process.env.PORT || 3000;
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Clara's Best server running on port ${PORT}`);
+    console.log(`📦 Connected to Aiven MySQL Cloud`);
+  });
 });
